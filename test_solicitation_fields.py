@@ -102,8 +102,60 @@ def test_phone_variants():
 
 
 def test_solicitation_no_false_positive_from_project_number():
-    f = extract_fields({"title": "Z2DA--537-24-106 Create Contractor Lie-Down Zone"})
-    assert f["Solicitation"] == MISSING
+    for title in ("Z2DA--537-24-106 Create Contractor Lie-Down Zone",
+                  "PLIERS, SLIP JOINT: IAW AMERICAN SOCIETY OF MECHANICAL ENGINEERS B107.500-2010",
+                  "4600 SHR MD1822AG SOUTH GREEN ROOF REPAIRS"):
+        assert extract_fields({"title": title})["Solicitation"] == MISSING, title
+
+
+def test_solicitation_piid_in_title():
+    f = extract_fields({"title": "FY23-28 General Construction Services BPA - W911S223S8000"})
+    assert f["Solicitation"] == "W911S223S8000"
+    f = extract_fields({"sam": {"description": "intends to issue 36C24226R0128 for Project 561-26-104"}})
+    assert f["Solicitation"] == "36C24226R0128"
+
+
+def test_regressions_round2():
+    from solicitation_fields import format_place
+    assert format_deadline("Oct 06, 2026 5:00 PM CDT", "IL") == "Oct 6, 2026 · 5:00 PM CT"
+    assert extract_fields({"sam": {"place": "East Orange, NJ 07018"}})["Place"] == "East Orange, New Jersey 07018"
+    assert extract_fields({"sam": {"place": "Multiple locations"}})["Place"] == "Multiple locations"
+    assert extract_fields({"pointOfContact": [None]})["POC"] == {"name": None, "email": None, "phone": None}
+    # An award's date_signed is not a posted date.
+    assert extract_fields({"enriched": {"date_signed": "2026-06-05"}})["Posted"] == MISSING
+    assert format_agency("DEPT OF DEFENSE.DEPT OF THE NAVY.NAVFAC.NAVFAC SOUTHEAST JACKSONVILLE FL") \
+        == "Dept. of Defense — Navy / NAVFAC Southeast Jacksonville FL"
+    assert format_agency("VETERANS AFFAIRS, DEPARTMENT OF.245-NETWORK CONTRACT OFFICE 5 (36C245)") \
+        == "Dept. of Veterans Affairs — 245-Network Contract Office 5 (36C245)"
+    # No place state: keep local time, DST-aware.
+    assert format_deadline("2026-10-06T17:00:00-05:00") == "Oct 6, 2026 · 5:00 PM CT"
+    assert format_deadline("2026-11-04T13:00:00-05:00") == "Nov 4, 2026 · 1:00 PM ET"
+    assert format_deadline("2026-10-09T15:00:00Z") == "Oct 9, 2026 · 11:00 AM ET"
+    assert format_place("FORT MEADE", "MD", "207551234") == "Fort Meade, Maryland 20755"
+
+
+def test_sam_enrich_backfills_missing_fields():
+    import io, json
+    from urllib.parse import parse_qs, urlparse
+    from sam_enrich import enrich, notice_id
+    nid = "218f2df333184fefa9a69e51f1443853"
+    assert notice_id(f"https://sam.gov/workspace/contract/opp/{nid}/view") == nid
+    assert notice_id(f"https://sam.gov/opp/{nid}/view") == nid
+    calls = []
+
+    def opener(url, timeout):
+        q = parse_qs(urlparse(url).query)
+        calls.append(q)
+        return io.BytesIO(json.dumps({"opportunitiesData": [SAM_W912DR26QA057]}).encode())
+
+    bid = {"title": "MINOS", "url": f"https://sam.gov/workspace/contract/opp/{nid}/view",
+           "poc_name": "Danielle Amico"}
+    contacts = [{"bids": [bid, dict(bid)]}]
+    stats = enrich(contacts, "KEY", opener=opener, pause=0)
+    assert stats["fetched"] == 1 and len(calls) == 1          # cached per notice ID
+    assert calls[0]["noticeid"] == [nid] and "postedFrom" in calls[0] and "postedTo" in calls[0]
+    f = extract_fields(contacts[0]["bids"][1])
+    assert f["_missing"] == [] and f["NAICS"] == "238160"
 
 
 if __name__ == "__main__":

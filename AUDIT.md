@@ -1,7 +1,7 @@
-# Solicitation email fields: port + audit
+# Solicitation email fields: port, fixes, audit
 
 ## Goal
-Every notification email from govcontract-engine shows all 8 rows, in the same format Muse (lead-magnet) uses:
+Every notification email or invitation shows all 8 rows in Muse's format:
 
 ```
 Agency        Dept. of Defense — Army / USACE Baltimore
@@ -15,63 +15,87 @@ POC           Michael Getz
               · michael.j.getz@usace.army.mil
               · (540) 761-4935
 ```
+Checked byte-for-byte by `test_w912dr26qa057_all_fields`.
 
-`test_solicitation_fields.py::test_w912dr26qa057_all_fields` checks this exact output.
-
-## What's in this repo
+## Files
 | File | Purpose |
 |---|---|
-| `solicitation_fields.py` | `extract_fields(record)` → 8 normalized fields; `render_html()` / `render_text()` for the email body |
-| `test_solicitation_fields.py` | 8 tests (run with `python3 test_solicitation_fields.py`, no dependencies) |
-| `audit_fields.py` | `python3 audit_fields.py records.json` reports how often each field is missing |
+| `solicitation_fields.py` | `extract_fields(record)` → the 8 fields; `render_html()` / `render_text()` email blocks |
+| `sam_enrich.py` | Backfills missing fields from the SAM.gov API by notice ID (`SAM_API_KEY` env var) |
+| `audit_fields.py` | `python3 audit_fields.py records.json` reports the missing-field rate per field |
+| `lead-magnet/build_contacts.py` | Muse contact builder, with deadline parsing fixed |
+| `lead-magnet/invitation_docx.py` | Muse invitation .docx; Job details now use `extract_fields` |
+| `test_solicitation_fields.py` | 11 tests, no dependencies: `python3 test_solicitation_fields.py` |
 
-`extract_fields` takes either a **raw SAM.gov Opportunities API v2 record** (`solicitationNumber`, `fullParentPathName`, `postedDate`, `responseDeadLine`, `naicsCode`, `typeOfSetAsideDescription`, `placeOfPerformance`, `pointOfContact[]`) or a **lead-magnet bid dict** (`solicitation`, `poc_*`, `sam{}`, `enriched{}`).
+`extract_fields` accepts a raw **SAM.gov Opportunities API v2** record, a **lead-magnet bid**, or a bid backfilled with `sam_record` (the SAM data takes priority).
 
-## Wiring into govcontract-engine
-At the point where the engine builds the email for an opportunity:
-
-```python
-from solicitation_fields import extract_fields, render_html, render_text
-
-fields = extract_fields(opportunity)   # the SAM.gov record as returned by the API
-html_block = render_html(fields)       # drop into the HTML body
-text_block = render_text(fields)       # drop into the plain-text part
-if fields["_missing"]:
-    log.warning("email %s missing %s", opportunity.get("solicitationNumber"), fields["_missing"])
+## Run order (Muse)
+```bash
+python3 lead-magnet/build_contacts.py Filtered_Leads.xlsx            # → lead-magnet-contacts.json
+SAM_API_KEY=xxxx python3 sam_enrich.py lead-magnet-contacts.json      # backfill NAICS/set-aside/place/posted
+python3 audit_fields.py lead-magnet-contacts.json                     # check coverage
+python3 lead-magnet/invitation_docx.py lead-magnet-contacts.json out/ # generate invitations
 ```
 
-Rows are **never dropped**. A missing value renders as `Not specified`, so a gap shows up in the email instead of the row silently disappearing.
+## Wiring into govcontract-engine
+```python
+from solicitation_fields import extract_fields, render_html, render_text
+fields = extract_fields(opportunity)          # SAM.gov record
+html_block, text_block = render_html(fields), render_text(fields)
+if fields["_missing"]:
+    log.warning("%s missing %s", opportunity.get("solicitationNumber"), fields["_missing"])
+```
+Rows are never dropped. A missing value renders as `Not specified`.
 
-## Audit: Muse (lead-magnet) source
-Data: `lead-magnet-contacts.json`, 140 contacts, 132 unique bids (72 open opportunities, 60 prime-award leads).
+---
 
-### Field coverage on the 72 open opportunities
-| Field | Filled | Note |
-|---|---|---|
-| Agency | 72/72 | |
-| Deadline | 72/72 | |
-| POC | 72/72 | |
-| Solicitation | 20/72 | 52 have `solicitation: null` |
-| NAICS | 9/72 | only stored when the SAM detail page was scraped |
-| Place | 9/72 | same |
-| Set-aside | 8/72 | same |
-| Posted | 8/72 | same |
+## Audit results (real data: 140 contacts, 266 live invitations, 72 unique open opportunities)
 
-**Muse only produces the full 8-field block for about 9 of 72 opportunities.** The W912DR26QA057 example worked because it was one of the records with a full SAM detail fetch. NAICS, set-aside, place, and posted date all come with the SAM.gov API record. govcontract-engine should read them from that response (this module does), not from a scraped `sam{}` sub-dict.
-
-### Bugs found in Muse (fixed in the port)
-| # | Where | Bug | Fix |
+### Old vs. fixed invitation Job details, on all 266 live invitations
+| Field | Changed | Example (old → fixed) | Verdict |
 |---|---|---|---|
-| 1 | `build_contacts.py` `TZ_ABBR` | The timezone label comes from the UTC offset: `-05:00` is always `CT` and `-04:00` is always `ET`. After DST ends (Nov 1, 2026), an Eastern deadline at `-05:00` gets labeled **CT**. Arizona `-07:00` gets labeled `PT`. | DST-aware `zoneinfo` conversion into the place of performance's state zone |
-| 2 | `build_contacts.py` | Naive deadlines are assumed to be **UTC**. SAM naive times are Eastern, so the displayed time is off by 4 to 5 hours. | Naive is treated as Eastern |
-| 3 | `invitation_docx.py` `Place` | Falls back to the **contractor's** state (`contact['state']`) when SAM has no place, which shows the wrong place of performance. Hits 63/72 opportunities. | Falls back to `Not specified` |
-| 4 | `invitation_docx.py` `extract_solicitation` | The loose "any mixed alphanumeric token" fallback takes VA project numbers (e.g. `Z2DA--561-26-104`) as the solicitation number | Fallback removed; only an explicit `Solicitation/RFQ/RFP/IFB No.` match is used |
-| 5 | `clean_agency` | Leaves raw SAM casing (`ENERGY, DEPARTMENT OF`) and doesn't shorten the path | Formats as `Dept. of X — Sub / Office`, with USACE district handling |
-| 6 | POC phone | Passed through raw (`6308403207`, `7088902524.0`) | Formatted as `(630) 840-3207`, extensions kept as `x202046` |
-| 7 | Set-aside | Keeps the FAR citation (`… (FAR 19.14)`), unlike the target format | Citation stripped; also falls back from `typeOfSetAside` codes (SBA, 8A, SDVOSBC…) |
-| 8 | `deadline_iso` | Some records store a date-only ISO (`2026-11-04`) next to a timed display string, so deadline math such as `days_left` and `expired` runs on midnight UTC | The module prefers a timed source and only falls back to the display string |
-| 9 | POC selection | Takes the first POC only, with no primary/secondary check | Prefers `type == "primary"` |
+| Place | 244 | `IL` → `Not specified` | **Bug fixed.** 234 showed the *contractor's* state as place of performance |
+| Owner / Agency | 266 | `ENERGY, DEPARTMENT OF — FERMILAB - DOE CONTRACTOR` → `Dept. of Energy — Fermilab - DOE Contractor` | Formatting |
+| Posted / NAICS / Set-aside | 266 | row missing → row present | **Rows added** (they were never in the docx) |
+| Official POC | 40 | `6308403207` → `(630) 840-3207` | Formatting |
+| Solicitation | 3 | `B107.500-2010` (an ASME standard), `MD1822AG` (a building code), `N68335-26-RFPREQ-BLG0000-` (truncated) → `Not specified` | **False positives removed** |
+| Bids due | 2 | `Nov 30, 2027 · 11:59 PM CT` → `11:59 PM ET` (source said EST) | **DST bug fixed** |
+| | | `Oct 12 · 1:00 PM CT` → `2:00 PM ET` (Ayer, MA) | Same instant, now in the place's local time |
 
-### Still open (needs govcontract-engine source)
-- I haven't read govcontract-engine's email template or SAM fetch code. Once it's on GitHub, check that the fetch keeps `pointOfContact`, `placeOfPerformance`, `typeOfSetAsideDescription`, and `fullParentPathName`. Some SAM search calls return a trimmed record.
-- `AGENCY_ALIASES` covers DoD, USACE, and the common civilian departments. Add any other agencies that show up in real sends.
+The old regex fallback did catch one real number: `W911S223S8000`. The fixed code keeps it with a standard federal solicitation-number (PIID) pattern, so nothing real is lost.
+
+### Coverage on the 72 open opportunities, before SAM backfill
+| Field | Filled |
+|---|---|
+| Agency, Deadline, POC | 72/72 |
+| Solicitation | 21/72 |
+| Place | 9/72 |
+| NAICS | 9/72 |
+| Posted, Set-aside | 8/72 |
+
+**Root cause:** Muse only scraped full SAM details for about 9 opportunities. `sam_enrich.py` fixes this by pulling the full record for every sam.gov URL; all 72 have one. It still needs to be run with your key. In tests it's checked against a mocked API only (`test_sam_enrich_backfills_missing_fields`).
+
+### Bugs fixed
+| # | File | Bug | Fix |
+|---|---|---|---|
+| 1 | `build_contacts.py` | The timezone label came from the offset (`-05:00` = CT always), so ET deadlines after Nov 1 read **CT** | DST-aware `zoneinfo` |
+| 2 | `build_contacts.py` | Naive deadlines were treated as **UTC**: time and `expired` were off by 4–5 h | Treated as Eastern (SAM.gov convention) |
+| 3 | `build_contacts.py` | Date-only deadlines expired at 00:00 UTC, the evening before the due date | Open until 11:59 PM ET that day |
+| 4 | `build_contacts.py` | Deadline parsed twice; module-level code ran on import with a hard-coded path | One parser; `main(xlsx)` / `build(rows, now)` |
+| 5 | `invitation_docx.py` | Place fell back to the **contractor's** state | Falls back to `Not specified` |
+| 6 | `invitation_docx.py` | Posted, NAICS, Set-aside rows missing | Rows added |
+| 7 | `invitation_docx.py` | Loose solicitation regex matched standards and building codes | Explicit label match or PIID only |
+| 8 | both | Raw phones and agency casing; FAR citation kept on set-aside; first POC used, not primary | Normalized; `type == primary` preferred |
+
+### Bugs found in my own first-pass module (also fixed)
+- An empty POC entry (`pointOfContact: [None]`) crashed `extract_fields`.
+- SAM-style strings (`Oct 06, 2026 5:00 PM CDT`) passed through unformatted.
+- Muse places kept the state abbreviation (`East Orange, NJ`) instead of the full name.
+- An award's `date_signed` was shown as **Posted**.
+- Agency casing was mangled (`245-NETWORK`, `Jacksonville Fl`).
+- Deadlines without a place state were all converted to ET. They now keep local time: the zone is picked by matching the offset on that date.
+
+### Still open
+- **govcontract-engine source isn't available here.** Wire it in with the snippet above, and make sure its SAM fetch keeps `pointOfContact`, `placeOfPerformance`, `typeOfSetAsideDescription`, and `fullParentPathName`.
+- `sam_enrich.py` searches notices posted in the last 364 days, the API's maximum window. Older notices come back as `not_found`.
+- Not end-to-end tested: `build_contacts.py` against the real `Filtered_Leads.xlsx` (not in the upload). It's unit-checked with synthetic rows instead.

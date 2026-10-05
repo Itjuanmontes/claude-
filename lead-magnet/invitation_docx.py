@@ -17,6 +17,9 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from solicitation_fields import MISSING, extract_fields
+
 DARK = RGBColor(0x10, 0x23, 0x3D)
 DARK_HEX = "10233D"
 GREEN_HEX = "087443"
@@ -26,7 +29,6 @@ PH = RGBColor(0x8A, 0x83, 0x76)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 FILL_HEX = "FFF3C4"
 FONT = "Calibri"
-MISSING = "Not specified"
 
 BRAND_UPPER = "LEAD MAGNET"
 BRAND = "Lead Magnet"
@@ -121,31 +123,7 @@ def sqf_items(trade, title):
 
 
 def extract_solicitation(bid):
-    if bid.get('solicitation'):
-        return bid['solicitation']
-    text = str(bid.get('title') or "") + " " + str((bid.get('sam') or {}).get('description') or "")
-    m = re.search(r'(?i)(?:solicitation|rfq|rfp|bid\s*no\.?)\s+([A-Z0-9][A-Z0-9\-.]{6,25})', text)
-    if m:
-        return m.group(1).strip(".,;:")
-    for tok in re.findall(r'\b[A-Z0-9][A-Z0-9\-.]{7,25}\b', text):
-        if re.search(r'\d', tok) and re.search(r'[A-Z]', tok):
-            return tok.strip(".,;:")
-    return MISSING
-
-
-def clean_agency(a):
-    if not a:
-        return MISSING
-    parts = []
-    for p in a.split("/"):
-        p = p.strip()
-        if p and p not in parts:
-            parts.append(p)
-    return " — ".join(parts[:3]) if parts else MISSING
-
-
-def val(x):
-    return x if x else MISSING
+    return extract_fields(bid)['Solicitation']
 
 
 def build_invitation(contact, bid):
@@ -158,9 +136,9 @@ def build_invitation(contact, bid):
         s.left_margin = Inches(0.7)
         s.right_margin = Inches(0.7)
 
-    solicitation = extract_solicitation(bid)
+    f = extract_fields(bid)
+    solicitation = f['Solicitation']
     sam = bid.get('sam') or {}
-    enr = bid.get('enriched') or {}
     trade = contact.get('category') or MISSING
 
     # Header band
@@ -185,8 +163,7 @@ def build_invitation(contact, bid):
 
     # Job details
     section(doc, "Job details")
-    poc_line = " · ".join(x for x in [bid.get('poc_name'), bid.get('poc_email'), bid.get('poc_phone')] if x) or MISSING
-    agency = clean_agency(sam.get('agency') or enr.get('awarding_agency'))
+    poc_line = " · ".join(x for x in f['POC'].values() if x) or MISSING
     issued_for = contact.get('business_name', MISSING)
     city, state = contact.get('city') or "", contact.get('state') or ""
     loc = ", ".join(x for x in [city, state] if x)
@@ -196,12 +173,16 @@ def build_invitation(contact, bid):
         ("Issued by", BRAND),
         ("Issued for", issued_for),
         ("Trade", trade),
-        ("Owner / Agency", agency),
-        ("Place", val(sam.get('place') or state)),
+        ("Owner / Agency", f['Agency']),
+        # Place of performance only. Never the contractor's own state.
+        ("Place", f['Place']),
         ("Solicitation", solicitation),
         ("Package", bid.get('type_label') or "Open Opportunity"),
         ("Documents issued", MISSING),
-        ("Bids due", val(bid.get('deadline_display') or sam.get('deadline'))),
+        ("Posted", f['Posted']),
+        ("Bids due", f['Deadline']),
+        ("NAICS", f['NAICS']),
+        ("Set-aside", f['Set-aside']),
         ("Official POC", poc_line),
         ("Official listing", bid.get('url') or MISSING),
     ]
